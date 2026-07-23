@@ -397,8 +397,8 @@ class SLAMApp:
 
                 if len(edge_x) > 0:
                     Z = latest_depth_map[edge_y, edge_x]
-                    X = (edge_x - cx) * Z / fx
-                    Y = (edge_y - cy) * Z / fy
+                    X = (edge_x - cx) * Z / self.fx
+                    Y = (edge_y - cy) * Z / self.fy
                     
                     pts_camera = np.stack((X, -Y, -Z), axis=-1)
                     t_world = np.array([tx, -ty, -tz])

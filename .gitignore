@@ -1,0 +1,32 @@
+# Virtual environment
+venv/
+.venv/
+ENV/
+
+# Model caching
+.cache/
+.huggingface/
+
+# Output maps and data
+maps/
+*.ply
+*.pcd
+
+# Temp images and logs
+*.jpg
+*.png
+*.log
+captured_test.jpg
+detected_edges.jpg
+depth_map.jpg
+test.jpg
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Python compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

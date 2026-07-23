@@ -30,3 +30,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Cloned external repos
+lingbot-map/
+lingbot-vision/

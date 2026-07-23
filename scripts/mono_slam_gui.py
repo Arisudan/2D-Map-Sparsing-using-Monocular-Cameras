@@ -246,10 +246,22 @@ class SLAMApp:
         self.pip_header.pack(fill=tk.X)
         self.pip_header.pack_propagate(False)
 
-        self.btn_toggle_view = tk.Button(self.pip_header, text="View: Color", command=self.toggle_pip_view, bg="#444444", fg="#ffffff",
+        # Bind drag events to the header frame
+        self.pip_header.bind("<ButtonPress-1>", self.start_pip_drag)
+        self.pip_header.bind("<B1-Motion>", self.do_pip_drag)
+
+        # Title Label (packed left, acts as drag handle)
+        self.lbl_pip_title = tk.Label(self.pip_header, text=" Feed (Drag)", fg="#aaaaaa", bg="#2d2d2d", font=("Arial", 7, "bold"))
+        self.lbl_pip_title.pack(side=tk.LEFT, fill=tk.Y, padx=(5, 2))
+        self.lbl_pip_title.bind("<ButtonPress-1>", self.start_pip_drag)
+        self.lbl_pip_title.bind("<B1-Motion>", self.do_pip_drag)
+
+        # Toggle view button
+        self.btn_toggle_view = tk.Button(self.pip_header, text="Color", command=self.toggle_pip_view, bg="#444444", fg="#ffffff",
                                          font=("Arial", 7, "bold"), activebackground="#666666", activeforeground="#ffffff", bd=0, padx=5)
         self.btn_toggle_view.pack(side=tk.LEFT, fill=tk.Y, padx=2, pady=2)
 
+        # Minimize/Maximize button
         self.btn_resize = tk.Button(self.pip_header, text="[-]", command=self.toggle_pip_size, bg="#444444", fg="#ffffff",
                                     font=("Arial", 7, "bold"), activebackground="#666666", activeforeground="#ffffff", bd=0, padx=5)
         self.btn_resize.pack(side=tk.RIGHT, fill=tk.Y, padx=2, pady=2)
@@ -281,7 +293,7 @@ class SLAMApp:
 
     def toggle_pip_view(self):
         self.show_edges = not self.show_edges
-        self.btn_toggle_view.config(text="View: Edges" if self.show_edges else "View: Color")
+        self.btn_toggle_view.config(text="Edges" if self.show_edges else "Color")
 
     def toggle_pip_size(self):
         self.pip_expanded = not self.pip_expanded
@@ -295,6 +307,27 @@ class SLAMApp:
             self.btn_resize.config(text="[-]")
         
         self.pip_label.config(width=self.pip_width, height=self.pip_height)
+
+    def start_pip_drag(self, event):
+        """Record initial mouse click coordinates relative to the PiP frame."""
+        self.pip_drag_start_x = event.x
+        self.pip_drag_start_y = event.y
+
+    def do_pip_drag(self, event):
+        """Calculate and update absolute coordinate placement during dragging."""
+        x = event.x_root - self.root.winfo_rootx() - self.pip_drag_start_x
+        y = event.y_root - self.root.winfo_rooty() - self.pip_drag_start_y
+        
+        # Clamp to window boundaries
+        win_w = self.root.winfo_width()
+        win_h = self.root.winfo_height()
+        pip_w = self.pip_frame.winfo_width()
+        pip_h = self.pip_frame.winfo_height()
+        
+        x = max(0, min(x, win_w - pip_w))
+        y = max(0, min(y, win_h - pip_h))
+        
+        self.pip_frame.place(x=x, y=y, anchor="nw", relx=0.0, rely=0.0)
 
     def start_pan(self, event):
         self.pan_start_x = event.x

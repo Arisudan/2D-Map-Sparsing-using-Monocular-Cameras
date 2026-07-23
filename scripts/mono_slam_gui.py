@@ -8,6 +8,7 @@ import struct
 import cv2
 import numpy as np
 import sys
+import json
 import open3d as o3d
 import datetime
 import threading
@@ -485,8 +486,8 @@ class SLAMApp:
         self.btn_stop.config(state=tk.DISABLED)
 
     def slam_worker_thread(self):
-        """Background thread handling video capture, visual odometry, and server requests."""
-        # Connect to RTX 5090 depth server
+        """Background thread handling video capture and MASt3R-SLAM server queries."""
+        # Connect to RTX 5090 MASt3R-SLAM server
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             client_socket.connect(('localhost', 5000))
@@ -494,29 +495,18 @@ class SLAMApp:
             messagebox.showerror("Connection Error", 
                                  f"Failed to connect to GPU Server on localhost:5000.\n{e}\n\n"
                                  "Make sure your SSH tunnel is open and the server script is running.")
-            self.root.after(0, self.reset_gui_state)
+            self.root.after(0, self.on_slam_stopped)
             return
 
         cap = cv2.VideoCapture(self.source_arg)
         if not cap.isOpened():
             messagebox.showerror("Camera Error", f"Could not open video source: {self.source_arg}")
             client_socket.close()
-            self.root.after(0, self.reset_gui_state)
+            self.root.after(0, self.on_slam_stopped)
             return
-
-        # Initialize Visual Odometry
-        vo = VisualOdometry(fx=self.fx, fy=self.fy, cx=self.cx, cy=self.cy)
 
         # Trajectory & SLAM Alignment States
         path_points = [np.array([0.0, 0.0, 0.0])]
-        smooth_t = None
-        alpha = 0.3
-        map_pts_2d = None
-
-        frame_count = 0
-        depth_interval = 10
-        latest_depth_map = None
-        latest_edges = None
 
         while self.running:
             ret, frame = cap.read()
@@ -524,203 +514,107 @@ class SLAMApp:
                 print("[SLAM Client] Video feed completed.")
                 break
 
-            frame_count += 1
             h, w = frame.shape[:2]
-            cx, cy = w / 2.0, h / 2.0
 
-            # --- STEP 1: Local Visual Odometry ---
-            R, t = vo.process_frame(frame)
-            
-            # Apply low-pass Jitter Filter
-            if smooth_t is None:
-                smooth_t = t.copy()
-            else:
-                smooth_t = alpha * t + (1.0 - alpha) * smooth_t
+            # 1. Compress frame to JPEG
+            _, img_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            img_bytes = img_encoded.tobytes()
 
-            tx, ty, tz = smooth_t[0, 0], smooth_t[1, 0], smooth_t[2, 0]
-            path_points.append(np.array([tx, -ty, -tz]))
-
-            # --- STEP 2: Offload Depth Request (Keyframe Filter) ---
-            is_keyframe = (frame_count % depth_interval == 1) or (latest_depth_map is None)
-            
-            if is_keyframe:
-                # Compress to JPEG
-                _, img_encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                img_bytes = img_encoded.tobytes()
-
-                try:
-                    # Send size + frame
-                    client_socket.sendall(struct.pack('>I', len(img_bytes)) + img_bytes)
-                    # Receive size + PNG depth map
-                    len_bytes = recv_all(client_socket, 4)
-                    if len_bytes is None:
-                        break
-                    depth_len = struct.unpack('>I', len_bytes)[0]
-                    depth_png_bytes = recv_all(client_socket, depth_len)
-                    if depth_png_bytes is None:
-                        break
-                except Exception as e:
-                    print(f"[SLAM Client] Network streaming error: {e}")
-                    break
-
-                # Decode PNG Depth
-                depth_arr = np.frombuffer(depth_png_bytes, dtype=np.uint8)
-                depth_uint16 = cv2.imdecode(depth_arr, cv2.IMREAD_UNCHANGED)
-                if depth_uint16 is not None:
-                    raw_depth = depth_uint16.astype(np.float32) / 1000.0
-                    median_depth = np.median(raw_depth)
-                    scaled_depth = raw_depth * (2.0 / (median_depth + 1e-6))
-                    latest_depth_map = np.clip(scaled_depth, 0.1, 10.0)
-
-                    # --- STEP 3: Depth-Gradient Edge Boundaries ---
-                    depth_norm = cv2.normalize(latest_depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-                    latest_edges = cv2.Canny(depth_norm, 15, 45)
-
-            # Retrieve active edge frame
-            edges = latest_edges if latest_edges is not None else np.zeros((h, w), dtype=np.uint8)
-
-            # --- STEP 4: 2D ICP Alignment & Mapping ---
-            if is_keyframe and latest_depth_map is not None:
-                edge_y, edge_x = np.where(edges > 0)
+            try:
+                # 2. Send JPEG size + image
+                client_socket.sendall(struct.pack('>I', len(img_bytes)) + img_bytes)
                 
-                # Subsample to avoid CPU lag
-                if len(edge_x) > 1000:
-                    indices = np.random.choice(len(edge_x), size=1000, replace=False)
-                    edge_x = edge_x[indices]
-                    edge_y = edge_y[indices]
+                # 3. Receive size of JSON response
+                len_bytes = recv_all(client_socket, 4)
+                if len_bytes is None:
+                    break
+                resp_len = struct.unpack('>I', len_bytes)[0]
+                
+                # 4. Receive JSON response bytes
+                resp_bytes = recv_all(client_socket, resp_len)
+                if resp_bytes is None:
+                    break
+            except Exception as e:
+                print(f"[SLAM Client] Network streaming error: {e}")
+                break
 
-                if len(edge_x) > 0:
-                    Z = latest_depth_map[edge_y, edge_x]
-                    X = (edge_x - cx) * Z / self.fx
-                    Y = (edge_y - cy) * Z / self.fy
+            # 5. Parse pose and 2D sparse edge points
+            try:
+                response = json.loads(resp_bytes.decode('utf-8'))
+                tx = response['tx']
+                ty = response['ty']
+                tz = response['tz']
+                R_list = response['R']
+                points_2d = response['points_2d']
+                
+                R = np.array(R_list)
+                
+                # Record coordinates for main-thread rendering
+                self.last_tx = tx
+                self.last_tz = tz
+                self.last_R = R
+                
+                path_points.append(np.array([tx, -ty, -tz]))
+                
+                # Update keyframe poses
+                self.keyframe_poses.append((tx, ty, tz, R))
+                if len(self.keyframe_poses) > 500:
+                    self.keyframe_poses.pop(0)
                     
-                    pts_camera = np.stack((X, -Y, -Z), axis=-1)
-                    # Transform camera points to world frame
-                    t_world = np.array([tx, -ty, -tz])
-                    pts_world = pts_camera.dot(R.T) + t_world
-                    
-                    # Run 2D ICP Alignment (Map-to-Scan)
-                    src_pts_2d = pts_world[:, [0, 2]]
-                    
-                    if map_pts_2d is not None:
-                        R_2d, t_2d = icp_2d(map_pts_2d, src_pts_2d)
-                        
-                        # Correct 3D points
-                        pts_world[:, [0, 2]] = src_pts_2d.dot(R_2d.T) + t_2d.T
-                        
-                        # Correct camera trajectory coordinates
-                        cam_pos_2d = np.array([tx, -tz]).reshape(2, 1)
-                        cam_pos_corrected = R_2d.dot(cam_pos_2d) + t_2d
-                        tx = cam_pos_corrected[0, 0]
-                        tz = -cam_pos_corrected[1, 0]
-                        
-                        # Correct latest coordinate in path
-                        path_points[-1] = np.array([tx, -ty, -tz])
-                    
-                    # --- LOOP CLOSURE CHECK & POSE GRAPH RELAXATION ---
-                    loop_closed = False
-                    if len(self.keyframe_data) > 60:
-                        for past_kf in self.keyframe_data[:-50]:  # At least 50 frames ago
-                            px, py, pz, pR = past_kf['pose']
-                            dist = np.sqrt((tx - px)**2 + (tz - pz)**2)
-                            if dist < 0.35:  # Spatial proximity (35 cm)
-                                # Align current scan to past keyframe
-                                R_loop, t_loop = icp_2d(past_kf['points'], src_pts_2d)
-                                
-                                # Verify alignment quality
-                                aligned_pts = src_pts_2d.dot(R_loop.T) + t_loop.T
-                                dists = np.linalg.norm(aligned_pts[:, None, :] - past_kf['points'][None, :, :], axis=-1)
-                                mean_err = np.mean(np.min(dists, axis=1))
-                                
-                                if mean_err < 0.10:  # Loop closure threshold (10 cm)
-                                    print(f"[SLAM] Loop closure detected! Aligned with Keyframe {past_kf['id']} (Error: {mean_err:.3f}m)")
-                                    tx_corr = tx + t_loop[0, 0]
-                                    tz_corr = tz + t_loop[1, 0]
-                                    err_x = tx_corr - tx
-                                    err_z = tz_corr - tz
-                                    
-                                    # Linear relaxation: distribute accumulated drift backward
-                                    start_id = past_kf['id']
-                                    end_id = len(self.keyframe_data)
-                                    num_loop_kfs = end_id - start_id + 1
-                                    
-                                    for idx in range(start_id, len(self.keyframe_data)):
-                                        factor = float(idx - start_id) / num_loop_kfs
-                                        kf = self.keyframe_data[idx]
-                                        kx, ky, kz, kR = kf['pose']
-                                        kf['pose'] = (kx + factor * err_x, ky, kz + factor * err_z, kR)
-                                        kf['points'][:, 0] += factor * err_x
-                                        kf['points'][:, 1] += factor * err_z
-                                    
-                                    # Update current tracking state
-                                    tx = tx_corr
-                                    tz = tz_corr
-                                    path_points[-1] = np.array([tx, -ty, -tz])
-                                    loop_closed = True
-                                    break
-
-                    # Store keyframe data
-                    current_kf = {
-                        'id': len(self.keyframe_data),
-                        'pose': (tx, ty, tz, R.copy()),
-                        'points': pts_world[:, [0, 2]].copy()
-                    }
-                    self.keyframe_data.append(current_kf)
-                    if len(self.keyframe_data) > 500:
-                        self.keyframe_data.pop(0)
-
-                    # Rebuild rendering cache from keyframe database
-                    self.keyframe_poses = [kf['pose'] for kf in self.keyframe_data]
-                    self.all_map_points = np.vstack([kf['points'] for kf in self.keyframe_data])
+                # Accumulate 2D sparse map points
+                points_2d_np = np.array(points_2d)
+                if len(points_2d_np) > 0:
+                    if self.all_map_points is None:
+                        self.all_map_points = points_2d_np
+                    else:
+                        self.all_map_points = np.vstack((self.all_map_points, points_2d_np))
                     if len(self.all_map_points) > 50000:
                         self.all_map_points = self.all_map_points[-50000:]
-
-                    # Accumulate into 3D Point Cloud geometry (for saving PLY file on exit)
-                    colors = frame[edge_y, edge_x][:, ::-1] / 255.0
+                        
+                    # Also accumulate to self.map_pcd for 3D saving on exit
+                    edge_pts_3d = np.zeros((len(points_2d_np), 3))
+                    edge_pts_3d[:, 0] = points_2d_np[:, 0]
+                    edge_pts_3d[:, 1] = -ty
+                    edge_pts_3d[:, 2] = points_2d_np[:, 1]
+                    
+                    colors = np.zeros((len(points_2d_np), 3))
+                    colors[:, :] = [1.0, 0.0, 0.0]  # Red color representation
+                    
                     old_pts = np.asarray(self.map_pcd.points)
                     old_cols = np.asarray(self.map_pcd.colors)
                     if len(old_pts) > 0:
-                        merged_pts = np.vstack((old_pts, pts_world))
+                        merged_pts = np.vstack((old_pts, edge_pts_3d))
                         merged_cols = np.vstack((old_cols, colors))
                     else:
-                        merged_pts = pts_world
+                        merged_pts = edge_pts_3d
                         merged_cols = colors
                     self.map_pcd.points = o3d.utility.Vector3dVector(merged_pts)
                     self.map_pcd.colors = o3d.utility.Vector3dVector(merged_cols)
                     self.map_pcd = self.map_pcd.voxel_down_sample(voxel_size=0.05)
+                    
+            except Exception as parse_err:
+                print(f"[SLAM Client] JSON parse error: {parse_err}")
+                continue
 
-            # Record active pose coordinates for main-thread rendering
-            self.last_tx = tx
-            self.last_tz = tz
-            self.last_R = R.copy()
-
-            # --- STEP 5: Update GUI Visual Elements (Thread-Safe) ---
-            # Pre-render video overlay inside the background worker thread
-
-            # 2. Prepare PiP Video Overlay
-            # Toggle between color and edge outlines
+            # Prepare PiP Video Overlay
             if self.show_edges:
-                pip_frame = cv2.resize(edges, (self.pip_width, self.pip_height))
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                edges_local = cv2.Canny(gray_frame, 50, 150)
+                pip_frame = cv2.resize(edges_local, (self.pip_width, self.pip_height))
                 pip_frame_rgb = cv2.cvtColor(pip_frame, cv2.COLOR_GRAY2RGB)
             else:
-                # Resize color frame to PiP dimensions and draw tracked features
                 color_pip = frame.copy()
-                if vo.prev_pts is not None:
-                    scale_x = float(self.pip_width) / w
-                    scale_y = float(self.pip_height) / h
-                    for pt in vo.prev_pts:
-                        cv2.circle(color_pip, (int(pt[0] * scale_x), int(pt[1] * scale_y)), 2, (0, 255, 0), -1)
                 resized_color = cv2.resize(color_pip, (self.pip_width, self.pip_height))
                 pip_frame_rgb = cv2.cvtColor(resized_color, cv2.COLOR_BGR2RGB)
 
-            # Schedule GUI elements update on main Tkinter thread (Background thread does not render map image now)
+            # Schedule GUI update on main thread
             self.root.after(0, self.update_gui_frames, pip_frame_rgb)
 
         # Cleanup
         cap.release()
         client_socket.close()
         print("[SLAM Client] Worker thread stopped.")
-
+        
         # Trigger thread exit callback
         self.root.after(0, self.on_slam_stopped)
 

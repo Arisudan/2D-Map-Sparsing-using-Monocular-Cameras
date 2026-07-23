@@ -399,9 +399,12 @@ class SLAMApp:
                 lines = cv2.HoughLinesP(gray_map, rho=1, theta=np.pi/180, threshold=12, minLineLength=20, maxLineGap=12)
                 if lines is not None:
                     for line in lines:
-                        x1, y1, x2, y2 = line[0]
-                        # Draw bold wall lines in dark red
-                        cv2.line(map_image, (x1, y1), (x2, y2), (0, 0, 160), 2)
+                        # Handle shape variations from OpenCV (e.g., (1, 4) vs (4,))
+                        pts = line[0] if (hasattr(line, 'shape') and len(line.shape) > 1 and line.shape[0] == 1) else line
+                        if len(pts) == 4:
+                            x1, y1, x2, y2 = pts
+                            # Draw bold wall lines in dark red
+                            cv2.line(map_image, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 160), 2)
                 
                 # 2. Draw precise 1-pixel red dots on top of the walls
                 for i in range(len(gxs)):

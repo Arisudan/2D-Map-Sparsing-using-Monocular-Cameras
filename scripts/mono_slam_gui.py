@@ -79,13 +79,43 @@ def icp_2d(ref_pts, src_pts, max_iterations=15, tolerance=1e-4):
         t_accum = R_step.dot(t_accum) + t_step
         
         src_aligned = src_pts.dot(R_accum.T) + t_accum.T
-        
+        # Check error convergence
         mean_error = np.mean(errors)
         if abs(mean_error - prev_error) < tolerance:
             break
         prev_error = mean_error
         
     return R_accum, t_accum
+
+def draw_camera_frustum_2d(img, tx, tz, R, scale, center, color, thickness=1):
+    """
+    Draws a 2D orthographic camera frustum (pyramid) pointing in the direction of R.
+    """
+    # Camera center in grid coordinates
+    g_cx = int(tx * scale) + center
+    g_cy = int(-tz * scale) + center
+
+    # Left/right corners in camera coordinates (looks along -Z in our convention)
+    d = 0.20
+    w_half = 0.10
+    p_left_cam = np.array([-w_half, 0, -d])
+    p_right_cam = np.array([w_half, 0, -d])
+
+    # Rotate to world coordinates
+    p_left_world = p_left_cam.dot(R.T) + np.array([tx, 0.0, -tz])
+    p_right_world = p_right_cam.dot(R.T) + np.array([tx, 0.0, -tz])
+
+    # Project to 2D grid coordinates
+    g_lx = int(p_left_world[0] * scale) + center
+    g_ly = int(-p_left_world[2] * scale) + center
+    
+    g_rx = int(p_right_world[0] * scale) + center
+    g_ry = int(-p_right_world[2] * scale) + center
+
+    # Draw wireframe triangle lines
+    cv2.line(img, (g_cx, g_cy), (g_lx, g_ly), color, thickness)
+    cv2.line(img, (g_cx, g_cy), (g_rx, g_ry), color, thickness)
+    cv2.line(img, (g_lx, g_ly), (g_rx, g_ry), color, thickness)
 
 def recv_all(sock, count):
     """Utility to receive exactly count bytes from a socket."""
@@ -117,11 +147,12 @@ class SLAMApp:
         self.show_edges = False     # Toggle between Color and Edges in PiP
         self.pip_expanded = False   # PiP window size state
 
-        # 2D Map Canvas Setup
+        # 2D Map Canvas Setup (BGR for color map points)
         self.map_size = 700
-        self.grid_map = np.zeros((self.map_size, self.map_size), dtype=np.uint8)
+        self.grid_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         self.draw_scale = 65.0
         self.center_grid = self.map_size // 2
+        self.keyframe_poses = []  # List of tuples: (tx, ty, tz, R)
 
         # 3D Mapping Geometry (retained for saving PLY)
         self.map_pcd = o3d.geometry.PointCloud()
@@ -268,8 +299,9 @@ class SLAMApp:
             self.source_arg = int(self.selected_source)
 
         # Reset map variables
-        self.grid_map = np.zeros((self.map_size, self.map_size), dtype=np.uint8)
+        self.grid_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         self.map_pcd = o3d.geometry.PointCloud()
+        self.keyframe_poses = []
 
         # Update button states
         self.running = True
@@ -401,6 +433,7 @@ class SLAMApp:
                     Y = (edge_y - cy) * Z / self.fy
                     
                     pts_camera = np.stack((X, -Y, -Z), axis=-1)
+                    # Transform camera points to world frame
                     t_world = np.array([tx, -ty, -tz])
                     pts_world = pts_camera.dot(R.T) + t_world
                     
@@ -430,6 +463,11 @@ class SLAMApp:
                         if len(map_pts_2d) > 15000:
                             map_pts_2d = map_pts_2d[-15000:]
 
+                    # Record keyframe camera pose (for ORB-SLAM frustum history)
+                    self.keyframe_poses.append((tx, ty, tz, R.copy()))
+                    if len(self.keyframe_poses) > 500:
+                        self.keyframe_poses.pop(0)
+
                     # Accumulate into 3D Point Cloud geometry (for saving PLY file on exit)
                     colors = frame[edge_y, edge_x][:, ::-1] / 255.0
                     old_pts = np.asarray(self.map_pcd.points)
@@ -450,35 +488,36 @@ class SLAMApp:
                     
                     valid_mask = (gx >= 0) & (gx < self.map_size) & (gy >= 0) & (gy < self.map_size)
                     
-                    # Draw points as visible circles instead of single tiny pixels
+                    # Draw points in RED (ORB-SLAM Style) as visible circles
                     for i in range(len(gx)):
                         if valid_mask[i]:
-                            cv2.circle(self.grid_map, (gx[i], gy[i]), 2, 255, -1)
+                            cv2.circle(self.grid_map, (gx[i], gy[i]), 2, (0, 0, 255), -1)
 
             # --- STEP 5: Update GUI Visual Elements (Thread-Safe) ---
-            # 1. Prepare Background Map Image
-            map_image = cv2.cvtColor(self.grid_map, cv2.COLOR_GRAY2BGR)
+            # 1. Prepare Background Map Image (Make a copy of red landmarks)
+            map_image = self.grid_map.copy()
             # Draw axis lines
             cv2.line(map_image, (self.center_grid, 0), (self.center_grid, self.map_size), (40, 40, 40), 1)
             cv2.line(map_image, (0, self.center_grid), (self.map_size, self.center_grid), (40, 40, 40), 1)
             
-            # Draw historical 2D trajectory path
-            for i in range(len(path_points) - 1):
-                p1 = path_points[i]
-                p2 = path_points[i + 1]
+            # Draw historical 2D trajectory path (Pose graph links in green)
+            for i in range(len(self.keyframe_poses) - 1):
+                p1 = self.keyframe_poses[i]
+                p2 = self.keyframe_poses[i + 1]
                 g1x = int(p1[0] * self.draw_scale) + self.center_grid
                 g1y = int(-p1[2] * self.draw_scale) + self.center_grid
                 g2x = int(p2[0] * self.draw_scale) + self.center_grid
                 g2y = int(-p2[2] * self.draw_scale) + self.center_grid
                 if (0 <= g1x < self.map_size and 0 <= g1y < self.map_size and 
                     0 <= g2x < self.map_size and 0 <= g2y < self.map_size):
-                    cv2.line(map_image, (g1x, g1y), (g2x, g2y), (0, 0, 255), 1)
+                    cv2.line(map_image, (g1x, g1y), (g2x, g2y), (0, 255, 0), 1)
             
-            # Draw current camera position (green dot)
-            cx_grid = int(tx * self.draw_scale) + self.center_grid
-            cy_grid = int(-tz * self.draw_scale) + self.center_grid
-            if 0 <= cx_grid < self.map_size and 0 <= cy_grid < self.map_size:
-                cv2.circle(map_image, (cx_grid, cy_grid), 5, (0, 255, 0), -1)
+            # Draw historical keyframes (Blue camera frustums)
+            for kx, ky, kz, kR in self.keyframe_poses:
+                draw_camera_frustum_2d(map_image, kx, kz, kR, self.draw_scale, self.center_grid, (255, 0, 0), 1)
+
+            # Draw current active camera (Green frustum)
+            draw_camera_frustum_2d(map_image, tx, tz, R, self.draw_scale, self.center_grid, (0, 255, 0), 2)
 
             # 2. Prepare PiP Video Overlay
             # Toggle between color and edge outlines

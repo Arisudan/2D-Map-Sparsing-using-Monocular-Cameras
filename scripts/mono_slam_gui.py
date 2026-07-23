@@ -161,6 +161,7 @@ class SLAMApp:
         self.last_tx = 0.0
         self.last_tz = 0.0
         self.last_R = np.eye(3)
+        self.keyframe_data = []    # Detailed history of keyframes for Loop Closure
 
         # 3D Mapping Geometry (retained for saving PLY)
         self.map_pcd = o3d.geometry.PointCloud()
@@ -384,14 +385,28 @@ class SLAMApp:
             cv2.line(map_image, (cx_draw, 0), (cx_draw, self.map_size), (40, 40, 40), 1)
             cv2.line(map_image, (0, cy_draw), (self.map_size, cy_draw), (40, 40, 40), 1)
             
-            # Draw historical red map points
+            # Draw historical red map points with Hough Line wall fitting (CAD look)
             if self.all_map_points is not None and len(self.all_map_points) > 0:
                 gxs = np.int32(self.all_map_points[:, 0] * self.draw_scale) + cx_draw
                 gys = np.int32(-self.all_map_points[:, 1] * self.draw_scale) + cy_draw
                 valid_mask = (gxs >= 0) & (gxs < self.map_size) & (gys >= 0) & (gys < self.map_size)
+                
+                # 1. Render binary grid to fit lines
+                gray_map = np.zeros((self.map_size, self.map_size), dtype=np.uint8)
+                gray_map[gys[valid_mask], gxs[valid_mask]] = 255
+                
+                # Run OpenCV Probabilistic Hough Line Transform to group points into straight walls
+                lines = cv2.HoughLinesP(gray_map, rho=1, theta=np.pi/180, threshold=12, minLineLength=20, maxLineGap=12)
+                if lines is not None:
+                    for line in lines:
+                        x1, y1, x2, y2 = line[0]
+                        # Draw bold wall lines in dark red
+                        cv2.line(map_image, (x1, y1), (x2, y2), (0, 0, 160), 2)
+                
+                # 2. Draw precise 1-pixel red dots on top of the walls
                 for i in range(len(gxs)):
                     if valid_mask[i]:
-                        cv2.circle(map_image, (gxs[i], gys[i]), 2, (0, 0, 255), -1)
+                        cv2.circle(map_image, (gxs[i], gys[i]), 1, (0, 0, 255), -1)
             
             # Draw historical 2D pose graph trajectory (Green lines)
             for i in range(len(self.keyframe_poses) - 1):
@@ -442,6 +457,7 @@ class SLAMApp:
         self.pan_offset_y = 0
         self.follow_camera = True
         self.btn_follow.config(text="Follow Target: ON", bg="#006600")
+        self.keyframe_data = []
         
         # Disable Save button while running
         self.btn_save.config(state=tk.DISABLED, bg="#333333")
@@ -598,18 +614,63 @@ class SLAMApp:
                         # Correct latest coordinate in path
                         path_points[-1] = np.array([tx, -ty, -tz])
                     
-                    # Accumulate corrected points dynamically
-                    if self.all_map_points is None:
-                        self.all_map_points = pts_world[:, [0, 2]]
-                    else:
-                        self.all_map_points = np.vstack((self.all_map_points, pts_world[:, [0, 2]]))
-                        if len(self.all_map_points) > 50000:
-                            self.all_map_points = self.all_map_points[-50000:]
+                    # --- LOOP CLOSURE CHECK & POSE GRAPH RELAXATION ---
+                    loop_closed = False
+                    if len(self.keyframe_data) > 60:
+                        for past_kf in self.keyframe_data[:-50]:  # At least 50 frames ago
+                            px, py, pz, pR = past_kf['pose']
+                            dist = np.sqrt((tx - px)**2 + (tz - pz)**2)
+                            if dist < 0.35:  # Spatial proximity (35 cm)
+                                # Align current scan to past keyframe
+                                R_loop, t_loop = icp_2d(past_kf['points'], src_pts_2d)
+                                
+                                # Verify alignment quality
+                                aligned_pts = src_pts_2d.dot(R_loop.T) + t_loop.T
+                                dists = np.linalg.norm(aligned_pts[:, None, :] - past_kf['points'][None, :, :], axis=-1)
+                                mean_err = np.mean(np.min(dists, axis=1))
+                                
+                                if mean_err < 0.10:  # Loop closure threshold (10 cm)
+                                    print(f"[SLAM] Loop closure detected! Aligned with Keyframe {past_kf['id']} (Error: {mean_err:.3f}m)")
+                                    tx_corr = tx + t_loop[0, 0]
+                                    tz_corr = tz + t_loop[1, 0]
+                                    err_x = tx_corr - tx
+                                    err_z = tz_corr - tz
+                                    
+                                    # Linear relaxation: distribute accumulated drift backward
+                                    start_id = past_kf['id']
+                                    end_id = len(self.keyframe_data)
+                                    num_loop_kfs = end_id - start_id + 1
+                                    
+                                    for idx in range(start_id, len(self.keyframe_data)):
+                                        factor = float(idx - start_id) / num_loop_kfs
+                                        kf = self.keyframe_data[idx]
+                                        kx, ky, kz, kR = kf['pose']
+                                        kf['pose'] = (kx + factor * err_x, ky, kz + factor * err_z, kR)
+                                        kf['points'][:, 0] += factor * err_x
+                                        kf['points'][:, 1] += factor * err_z
+                                    
+                                    # Update current tracking state
+                                    tx = tx_corr
+                                    tz = tz_corr
+                                    path_points[-1] = np.array([tx, -ty, -tz])
+                                    loop_closed = True
+                                    break
 
-                    # Record keyframe camera pose (for ORB-SLAM frustum history)
-                    self.keyframe_poses.append((tx, ty, tz, R.copy()))
-                    if len(self.keyframe_poses) > 500:
-                        self.keyframe_poses.pop(0)
+                    # Store keyframe data
+                    current_kf = {
+                        'id': len(self.keyframe_data),
+                        'pose': (tx, ty, tz, R.copy()),
+                        'points': pts_world[:, [0, 2]].copy()
+                    }
+                    self.keyframe_data.append(current_kf)
+                    if len(self.keyframe_data) > 500:
+                        self.keyframe_data.pop(0)
+
+                    # Rebuild rendering cache from keyframe database
+                    self.keyframe_poses = [kf['pose'] for kf in self.keyframe_data]
+                    self.all_map_points = np.vstack([kf['points'] for kf in self.keyframe_data])
+                    if len(self.all_map_points) > 50000:
+                        self.all_map_points = self.all_map_points[-50000:]
 
                     # Accumulate into 3D Point Cloud geometry (for saving PLY file on exit)
                     colors = frame[edge_y, edge_x][:, ::-1] / 255.0

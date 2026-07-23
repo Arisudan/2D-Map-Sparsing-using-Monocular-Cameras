@@ -229,9 +229,13 @@ class SLAMApp:
                                    font=("Arial", 9, "bold"), activebackground="#009900", activeforeground="#ffffff", bd=0, pady=5)
         self.btn_start.pack(fill=tk.X, pady=(0, 5))
 
-        self.btn_stop = tk.Button(self.ctrl_frame, text="STOP & SAVE MAP", command=self.stop_slam, state=tk.DISABLED, bg="#990000", fg="#ffffff",
+        self.btn_stop = tk.Button(self.ctrl_frame, text="STOP SLAM", command=self.stop_slam, state=tk.DISABLED, bg="#990000", fg="#ffffff",
                                   font=("Arial", 9, "bold"), activebackground="#cc0000", activeforeground="#ffffff", bd=0, pady=5)
-        self.btn_stop.pack(fill=tk.X)
+        self.btn_stop.pack(fill=tk.X, pady=(0, 5))
+
+        self.btn_save = tk.Button(self.ctrl_frame, text="SAVE MAP", command=self.save_map, state=tk.DISABLED, bg="#333333", fg="#ffffff",
+                                  font=("Arial", 9, "bold"), activebackground="#0055ff", activeforeground="#ffffff", bd=0, pady=5)
+        self.btn_save.pack(fill=tk.X)
 
         # 3. FLOATING VIDEO PIP PANEL (Top-Right)
         self.pip_frame = tk.Frame(self.root, bg="#1e1e1e", bd=2, relief=tk.SOLID)
@@ -405,6 +409,9 @@ class SLAMApp:
         self.pan_offset_y = 0
         self.follow_camera = True
         self.btn_follow.config(text="Follow Target: ON", bg="#006600")
+        
+        # Disable Save button while running
+        self.btn_save.config(state=tk.DISABLED, bg="#333333")
 
         # Update button states
         self.running = True
@@ -617,8 +624,8 @@ class SLAMApp:
         client_socket.close()
         print("[SLAM Client] Worker thread stopped.")
 
-        # Save map on exit
-        self.root.after(0, self.save_map_and_reset)
+        # Trigger thread exit callback
+        self.root.after(0, self.on_slam_stopped)
 
     def update_gui_frames(self, pip_frame_rgb):
         """Thread-safe update of Tkinter widgets using PIL."""
@@ -630,8 +637,24 @@ class SLAMApp:
         self.tk_pip_img = ImageTk.PhotoImage(pil_pip)
         self.pip_label.config(image=self.tk_pip_img)
 
-    def save_map_and_reset(self):
-        # Save point cloud PLY map
+    def on_slam_stopped(self):
+        """Callback when the background SLAM thread finishes."""
+        self.running = False
+        self.btn_start.config(state=tk.NORMAL, bg="#006600")
+        self.btn_stop.config(state=tk.DISABLED, bg="#333333")
+        self.on_source_change()  # Re-evaluate Browse button state
+
+        # Enable the Save button if we have points in memory
+        if len(self.map_pcd.points) > 0:
+            self.btn_save.config(state=tk.NORMAL, bg="#0055ff")
+        else:
+            self.btn_save.config(state=tk.DISABLED, bg="#333333")
+
+        # Keep previews visible, but stop video feed updates
+        self.pip_label.config(image="")
+
+    def save_map(self):
+        """Saves the current accumulated 3D map from memory to a PLY file."""
         if len(self.map_pcd.points) > 0:
             os.makedirs("maps", exist_ok=True)
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -639,23 +662,12 @@ class SLAMApp:
             print(f"[SLAM Client] Saving accumulated 3D map to '{filename}'...")
             success = o3d.io.write_point_cloud(filename, self.map_pcd)
             if success:
-                messagebox.showinfo("Success", f"SLAM Mapping complete!\n3D Map successfully saved to:\n{filename}")
+                messagebox.showinfo("Success", f"3D PLY Map successfully saved to:\n{filename}")
+                self.btn_save.config(state=tk.DISABLED, bg="#333333")  # Disable after saving once
             else:
                 messagebox.showerror("Error", "Failed to save the 3D PLY map.")
         else:
-            messagebox.showwarning("Warning", "SLAM stopped. Map is empty, nothing to save.")
-
-        self.reset_gui_state()
-
-    def reset_gui_state(self):
-        self.running = False
-        self.btn_start.config(state=tk.NORMAL, bg="#006600")
-        self.btn_stop.config(state=tk.DISABLED)
-        self.on_source_change()  # Re-evaluate Browse button state
-
-        # Clear previews
-        self.update_map_display()
-        self.pip_label.config(image="")
+            messagebox.showwarning("Warning", "Map is empty, nothing to save.")
 
 
 if __name__ == "__main__":

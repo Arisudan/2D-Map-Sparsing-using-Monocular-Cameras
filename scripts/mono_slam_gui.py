@@ -449,7 +449,11 @@ class SLAMApp:
                     gy = np.int32(-pts_world[:, 2] * self.draw_scale) + self.center_grid
                     
                     valid_mask = (gx >= 0) & (gx < self.map_size) & (gy >= 0) & (gy < self.map_size)
-                    self.grid_map[gy[valid_mask], gx[valid_mask]] = 255
+                    
+                    # Draw points as visible circles instead of single tiny pixels
+                    for i in range(len(gx)):
+                        if valid_mask[i]:
+                            cv2.circle(self.grid_map, (gx[i], gy[i]), 2, 255, -1)
 
             # --- STEP 5: Update GUI Visual Elements (Thread-Safe) ---
             # 1. Prepare Background Map Image

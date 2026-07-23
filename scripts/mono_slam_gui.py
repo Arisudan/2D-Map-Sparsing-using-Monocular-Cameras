@@ -87,13 +87,13 @@ def icp_2d(ref_pts, src_pts, max_iterations=15, tolerance=1e-4):
         
     return R_accum, t_accum
 
-def draw_camera_frustum_2d(img, tx, tz, R, scale, center, color, thickness=1):
+def draw_camera_frustum_2d(img, tx, tz, R, scale, cx_draw, cy_draw, color, thickness=1):
     """
     Draws a 2D orthographic camera frustum (pyramid) pointing in the direction of R.
     """
     # Camera center in grid coordinates
-    g_cx = int(tx * scale) + center
-    g_cy = int(-tz * scale) + center
+    g_cx = int(tx * scale) + cx_draw
+    g_cy = int(-tz * scale) + cy_draw
 
     # Left/right corners in camera coordinates (looks along -Z in our convention)
     d = 0.20
@@ -106,11 +106,11 @@ def draw_camera_frustum_2d(img, tx, tz, R, scale, center, color, thickness=1):
     p_right_world = p_right_cam.dot(R.T) + np.array([tx, 0.0, -tz])
 
     # Project to 2D grid coordinates
-    g_lx = int(p_left_world[0] * scale) + center
-    g_ly = int(-p_left_world[2] * scale) + center
+    g_lx = int(p_left_world[0] * scale) + cx_draw
+    g_ly = int(-p_left_world[2] * scale) + cy_draw
     
-    g_rx = int(p_right_world[0] * scale) + center
-    g_ry = int(-p_right_world[2] * scale) + center
+    g_rx = int(p_right_world[0] * scale) + cx_draw
+    g_ry = int(-p_right_world[2] * scale) + cy_draw
 
     # Draw wireframe triangle lines
     cv2.line(img, (g_cx, g_cy), (g_lx, g_ly), color, thickness)
@@ -147,12 +147,20 @@ class SLAMApp:
         self.show_edges = False     # Toggle between Color and Edges in PiP
         self.pip_expanded = False   # PiP window size state
 
-        # 2D Map Canvas Setup (BGR for color map points)
+        # 2D Map Canvas Setup (Dynamic rendering parameters)
         self.map_size = 700
-        self.grid_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         self.draw_scale = 65.0
         self.center_grid = self.map_size // 2
-        self.keyframe_poses = []  # List of tuples: (tx, ty, tz, R)
+        
+        # SLAM Alignment & Map Registry States
+        self.keyframe_poses = []   # List of tuples: (tx, ty, tz, R)
+        self.all_map_points = None # Dynamic numpy array of shape (N, 2) storing world (X, Z)
+        self.follow_camera = True   # Camera Follow active by default
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+        self.last_tx = 0.0
+        self.last_tz = 0.0
+        self.last_R = np.eye(3)
 
         # 3D Mapping Geometry (retained for saving PLY)
         self.map_pcd = o3d.geometry.PointCloud()
@@ -167,6 +175,13 @@ class SLAMApp:
 
         # Draw initial blank map
         self.update_map_display()
+
+        # Bind mouse events for panning and zooming on the map
+        self.map_label.bind("<ButtonPress-1>", self.start_pan)
+        self.map_label.bind("<B1-Motion>", self.do_pan)
+        self.map_label.bind("<MouseWheel>", self.zoom_map)
+        self.map_label.bind("<Button-4>", self.zoom_map)  # Linux scroll up
+        self.map_label.bind("<Button-5>", self.zoom_map)  # Linux scroll down
 
         # 2. FLOATING CONTROL PANEL (Top-Left)
         self.ctrl_frame = tk.Frame(self.root, bg="#1e1e1e", bd=2, relief=tk.SOLID, padx=10, pady=10)
@@ -202,6 +217,12 @@ class SLAMApp:
 
         self.lbl_filename = tk.Label(self.ctrl_frame, text="No file selected", fg="#aaaaaa", bg="#1e1e1e", wraplength=180, justify=tk.LEFT)
         self.lbl_filename.pack(anchor="w", pady=(0, 10))
+
+        # Follow Target Toggle Button (Default ON)
+        self.btn_follow = tk.Button(self.ctrl_frame, text="Follow Target: ON", command=self.toggle_follow,
+                                    bg="#006600", fg="#ffffff", font=("Arial", 9, "bold"), 
+                                    activebackground="#009900", activeforeground="#ffffff", bd=0, pady=5)
+        self.btn_follow.pack(fill=tk.X, pady=(0, 10))
 
         # Operation Buttons
         self.btn_start = tk.Button(self.ctrl_frame, text="START SLAM", command=self.start_slam, bg="#006600", fg="#ffffff",
@@ -271,13 +292,88 @@ class SLAMApp:
         
         self.pip_label.config(width=self.pip_width, height=self.pip_height)
 
+    def start_pan(self, event):
+        self.pan_start_x = event.x
+        self.pan_start_y = event.y
+
+    def do_pan(self, event):
+        dx = event.x - self.pan_start_x
+        dy = event.y - self.pan_start_y
+        self.pan_offset_x += dx
+        self.pan_offset_y += dy
+        self.pan_start_x = event.x
+        self.pan_start_y = event.y
+        self.follow_camera = False
+        self.btn_follow.config(text="Follow Target: OFF", bg="#555555")
+        self.update_map_display()
+
+    def zoom_map(self, event):
+        # Handle scroll wheel zooming (Windows/macOS: delta, Linux: event.num)
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            zoom_factor = 1.15
+        else:
+            zoom_factor = 0.85
+        
+        self.draw_scale = np.clip(self.draw_scale * zoom_factor, 15.0, 500.0)
+        self.update_map_display()
+
+    def toggle_follow(self):
+        self.follow_camera = not self.follow_camera
+        if self.follow_camera:
+            self.btn_follow.config(text="Follow Target: ON", bg="#006600")
+            self.pan_offset_x = 0
+            self.pan_offset_y = 0
+        else:
+            self.btn_follow.config(text="Follow Target: OFF", bg="#555555")
+        self.update_map_display()
+
     def update_map_display(self, map_image=None):
         """Draws the current 2D sparse map array onto the background label."""
         if map_image is None:
-            # Draw standard empty map canvas with coordinate axis
+            # Create a blank BGR map canvas
             map_image = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
-            cv2.line(map_image, (self.center_grid, 0), (self.center_grid, self.map_size), (40, 40, 40), 1)
-            cv2.line(map_image, (0, self.center_grid), (self.map_size, self.center_grid), (40, 40, 40), 1)
+            
+            # Determine drawing center based on camera follow state
+            tx, tz = self.last_tx, self.last_tz
+            
+            if self.follow_camera:
+                self.pan_offset_x = -int(tx * self.draw_scale)
+                self.pan_offset_y = -int(-tz * self.draw_scale)
+                
+            cx_draw = self.center_grid + self.pan_offset_x
+            cy_draw = self.center_grid + self.pan_offset_y
+
+            # Draw axis lines
+            cv2.line(map_image, (cx_draw, 0), (cx_draw, self.map_size), (40, 40, 40), 1)
+            cv2.line(map_image, (0, cy_draw), (self.map_size, cy_draw), (40, 40, 40), 1)
+            
+            # Draw historical red map points
+            if self.all_map_points is not None and len(self.all_map_points) > 0:
+                gxs = np.int32(self.all_map_points[:, 0] * self.draw_scale) + cx_draw
+                gys = np.int32(-self.all_map_points[:, 1] * self.draw_scale) + cy_draw
+                valid_mask = (gxs >= 0) & (gxs < self.map_size) & (gys >= 0) & (gys < self.map_size)
+                for i in range(len(gxs)):
+                    if valid_mask[i]:
+                        cv2.circle(map_image, (gxs[i], gys[i]), 2, (0, 0, 255), -1)
+            
+            # Draw historical 2D pose graph trajectory (Green lines)
+            for i in range(len(self.keyframe_poses) - 1):
+                p1 = self.keyframe_poses[i]
+                p2 = self.keyframe_poses[i + 1]
+                g1x = int(p1[0] * self.draw_scale) + cx_draw
+                g1y = int(-p1[2] * self.draw_scale) + cy_draw
+                g2x = int(p2[0] * self.draw_scale) + cx_draw
+                g2y = int(-p2[2] * self.draw_scale) + cy_draw
+                if (0 <= g1x < self.map_size and 0 <= g1y < self.map_size and 
+                    0 <= g2x < self.map_size and 0 <= g2y < self.map_size):
+                    cv2.line(map_image, (g1x, g1y), (g2x, g2y), (0, 255, 0), 1)
+
+            # Draw blue historical keyframes (Camera frustums)
+            for kx, ky, kz, kR in self.keyframe_poses:
+                draw_camera_frustum_2d(map_image, kx, kz, kR, self.draw_scale, cx_draw, cy_draw, (255, 0, 0), 1)
+
+            # Draw current camera frustum (Green)
+            draw_camera_frustum_2d(map_image, tx, tz, self.last_R, self.draw_scale, cx_draw, cy_draw, (0, 255, 0), 2)
         
         # Convert BGR to RGB for PIL
         rgb_img = cv2.cvtColor(map_image, cv2.COLOR_BGR2RGB)
@@ -299,9 +395,16 @@ class SLAMApp:
             self.source_arg = int(self.selected_source)
 
         # Reset map variables
-        self.grid_map = np.zeros((self.map_size, self.map_size, 3), dtype=np.uint8)
         self.map_pcd = o3d.geometry.PointCloud()
         self.keyframe_poses = []
+        self.all_map_points = None
+        self.last_tx = 0.0
+        self.last_tz = 0.0
+        self.last_R = np.eye(3)
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+        self.follow_camera = True
+        self.btn_follow.config(text="Follow Target: ON", bg="#006600")
 
         # Update button states
         self.running = True
@@ -455,13 +558,13 @@ class SLAMApp:
                         # Correct latest coordinate in path
                         path_points[-1] = np.array([tx, -ty, -tz])
                     
-                    # Accumulate corrected points
-                    if map_pts_2d is None:
-                        map_pts_2d = pts_world[:, [0, 2]]
+                    # Accumulate corrected points dynamically
+                    if self.all_map_points is None:
+                        self.all_map_points = pts_world[:, [0, 2]]
                     else:
-                        map_pts_2d = np.vstack((map_pts_2d, pts_world[:, [0, 2]]))
-                        if len(map_pts_2d) > 15000:
-                            map_pts_2d = map_pts_2d[-15000:]
+                        self.all_map_points = np.vstack((self.all_map_points, pts_world[:, [0, 2]]))
+                        if len(self.all_map_points) > 50000:
+                            self.all_map_points = self.all_map_points[-50000:]
 
                     # Record keyframe camera pose (for ORB-SLAM frustum history)
                     self.keyframe_poses.append((tx, ty, tz, R.copy()))
@@ -482,42 +585,13 @@ class SLAMApp:
                     self.map_pcd.colors = o3d.utility.Vector3dVector(merged_cols)
                     self.map_pcd = self.map_pcd.voxel_down_sample(voxel_size=0.05)
 
-                    # Project points onto 2D Top-Down Floor Plan
-                    gx = np.int32(pts_world[:, 0] * self.draw_scale) + self.center_grid
-                    gy = np.int32(-pts_world[:, 2] * self.draw_scale) + self.center_grid
-                    
-                    valid_mask = (gx >= 0) & (gx < self.map_size) & (gy >= 0) & (gy < self.map_size)
-                    
-                    # Draw points in RED (ORB-SLAM Style) as visible circles
-                    for i in range(len(gx)):
-                        if valid_mask[i]:
-                            cv2.circle(self.grid_map, (gx[i], gy[i]), 2, (0, 0, 255), -1)
+            # Record active pose coordinates for main-thread rendering
+            self.last_tx = tx
+            self.last_tz = tz
+            self.last_R = R.copy()
 
             # --- STEP 5: Update GUI Visual Elements (Thread-Safe) ---
-            # 1. Prepare Background Map Image (Make a copy of red landmarks)
-            map_image = self.grid_map.copy()
-            # Draw axis lines
-            cv2.line(map_image, (self.center_grid, 0), (self.center_grid, self.map_size), (40, 40, 40), 1)
-            cv2.line(map_image, (0, self.center_grid), (self.map_size, self.center_grid), (40, 40, 40), 1)
-            
-            # Draw historical 2D trajectory path (Pose graph links in green)
-            for i in range(len(self.keyframe_poses) - 1):
-                p1 = self.keyframe_poses[i]
-                p2 = self.keyframe_poses[i + 1]
-                g1x = int(p1[0] * self.draw_scale) + self.center_grid
-                g1y = int(-p1[2] * self.draw_scale) + self.center_grid
-                g2x = int(p2[0] * self.draw_scale) + self.center_grid
-                g2y = int(-p2[2] * self.draw_scale) + self.center_grid
-                if (0 <= g1x < self.map_size and 0 <= g1y < self.map_size and 
-                    0 <= g2x < self.map_size and 0 <= g2y < self.map_size):
-                    cv2.line(map_image, (g1x, g1y), (g2x, g2y), (0, 255, 0), 1)
-            
-            # Draw historical keyframes (Blue camera frustums)
-            for kx, ky, kz, kR in self.keyframe_poses:
-                draw_camera_frustum_2d(map_image, kx, kz, kR, self.draw_scale, self.center_grid, (255, 0, 0), 1)
-
-            # Draw current active camera (Green frustum)
-            draw_camera_frustum_2d(map_image, tx, tz, R, self.draw_scale, self.center_grid, (0, 255, 0), 2)
+            # Pre-render video overlay inside the background worker thread
 
             # 2. Prepare PiP Video Overlay
             # Toggle between color and edge outlines
@@ -535,8 +609,8 @@ class SLAMApp:
                 resized_color = cv2.resize(color_pip, (self.pip_width, self.pip_height))
                 pip_frame_rgb = cv2.cvtColor(resized_color, cv2.COLOR_BGR2RGB)
 
-            # Schedule GUI elements update on main Tkinter thread
-            self.root.after(0, self.update_gui_frames, map_image, pip_frame_rgb)
+            # Schedule GUI elements update on main Tkinter thread (Background thread does not render map image now)
+            self.root.after(0, self.update_gui_frames, pip_frame_rgb)
 
         # Cleanup
         cap.release()
@@ -546,10 +620,10 @@ class SLAMApp:
         # Save map on exit
         self.root.after(0, self.save_map_and_reset)
 
-    def update_gui_frames(self, map_image, pip_frame_rgb):
+    def update_gui_frames(self, pip_frame_rgb):
         """Thread-safe update of Tkinter widgets using PIL."""
-        # 1. Update full-screen background map
-        self.update_map_display(map_image)
+        # 1. Dynamically render full-screen background map on UI thread
+        self.update_map_display()
 
         # 2. Update top-right floating PiP frame
         pil_pip = Image.fromarray(pip_frame_rgb)

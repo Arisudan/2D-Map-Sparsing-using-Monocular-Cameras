@@ -16,6 +16,7 @@ maps/
 *.jpg
 *.png
 *.log
+*.mp4
 captured_test.jpg
 detected_edges.jpg
 depth_map.jpg
